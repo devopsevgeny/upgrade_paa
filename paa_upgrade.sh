@@ -86,6 +86,37 @@ print_logo() {
 EOF
   printf '%b\n\n' "${COLOR_BRAND}PAA UPGRADE SCRIPT${COLOR_RESET}"
 }
+# ============================================================================
+# Helper Functions (NEW)
+# ============================================================================
+
+# Helper to replace a full function block using sed
+# This function is used by merge_aliases_files to safely replace functions.
+# It uses a temporary file to handle multi-line content correctly.
+replace_function_with_sed() {
+  local output_file="$1" func_name="$2" func_content="$3"
+  
+  log_info "Replacing function '$func_name' in '$output_file'..."
+  
+  # Write the new function content to a temporary file
+  local temp_file
+  temp_file=$(mktemp)
+  printf '%s\n' "$func_content" > "$temp_file"
+  
+  # Use sed to find the function block and replace it with the new content
+  sed -i -e "/^[[:space:]]*\(function[[:space:]]\+\)\?${func_name}[[:space:]]*(\(\))?[[:space:]]*{/ {
+    :start
+    /^[[:space:]]*}/! {
+      N
+      b start
+    }
+    r $temp_file
+    d
+  }" "$output_file"
+  
+  # Clean up the temporary file
+  rm "$temp_file"
+}
 
 # ============================================================================
 # Pure Bash Alias File Parser
@@ -162,137 +193,51 @@ parse_aliases_file() {
   ' "$file"
 }
 
-merge_aliases_files() {
+merge_aliases_files_simple() {
   local old_file="$1" new_file="$2" output="$3"
   
-  log_info "Merging alias files..."
+  log_info "Merging alias files with simple strategy..."
   
+  # Parse both files
   local old_data new_data
   old_data=$(parse_aliases_file "$old_file")
   new_data=$(parse_aliases_file "$new_file")
   
-  declare -A old_exports old_aliases old_functions
-  declare -A new_exports new_aliases new_functions
+  # Build associative arrays
+  declare -A old_all new_all
   declare -a new_order=()
   
+  # Load old file data
   while IFS=$'\t' read -r type name content; do
-    case "$type" in
-      export) old_exports["$name"]="$content" ;;
-      alias) old_aliases["$name"]="$content" ;;
-      function) old_functions["$name"]="$content" ;;
-    esac
+    old_all["$type:$name"]="$content"
   done <<< "$old_data"
   
+  # Load new file data and preserve order
   while IFS=$'\t' read -r type name content; do
     new_order+=("$type:$name")
-    case "$type" in
-      export) new_exports["$name"]="$content" ;;
-      alias) new_aliases["$name"]="$content" ;;
-      function) new_functions["$name"]="$content" ;;
-    esac
+    new_all["$type:$name"]="$content"
   done <<< "$new_data"
   
-  declare -a preserved_items=()
-  
+  # Start building output
   {
-    echo "# PID Directories"
+    echo "# PID Directories" # Example header
     
     for item in "${new_order[@]}"; do
-      local type="${item%%:*}" name="${item#*:}"
-      
-      if [[ "$type" == "export" ]]; then
-        case "$name" in
-          PAA_PACKAGE_VERSION|PLAINID_HOME)
-            echo "${new_exports[$name]}"
-            ;;
-          JAVA_HOME|PATH|REDIS_*|WARP_PORT|APP_VDB_LAZY_INVALIDATE|AGENT_AWAITING_DURATION|CLIENT_SECRET_KEY|TENANT_ID|PAA_ID|REMOTE_WARP)
-            if [[ -n "${old_exports[$name]:-}" ]]; then
-              echo "${old_exports[$name]}"
-              [[ "${old_exports[$name]}" != "${new_exports[$name]:-}" ]] && preserved_items+=("export:$name")
-            elif [[ -n "${new_exports[$name]:-}" ]]; then
-              echo "${new_exports[$name]}"
-            fi
-            ;;
-          *)
-            if [[ -n "${old_exports[$name]:-}" ]]; then
-              echo "${old_exports[$name]}"
-              [[ "${old_exports[$name]}" != "${new_exports[$name]}" ]] && preserved_items+=("export:$name")
-            else
-              echo "${new_exports[$name]}"
-            fi
-            ;;
-        esac
-        unset old_exports["$name"]
+      if [[ -n "${old_all[$item]}" ]]; then
+        # Use content from old file if it exists
+        log_info "Using old content for: $item"
+        printf '%s\n' "${old_all[$item]}"
+      else
+        # Use content from new file
+        log_info "Using new content for: $item"
+        printf '%s\n' "${new_all[$item]}"
       fi
     done
     
-    if [[ ${#old_exports[@]} -gt 0 ]]; then
-      echo ""
-      echo "# Custom exports preserved from previous version"
-      for name in "${!old_exports[@]}"; do
-        echo "${old_exports[$name]}"
-        preserved_items+=("export:$name")
-      done
-    fi
-    
-    echo ""
-    echo "# Health check"
-    
-    for item in "${new_order[@]}"; do
-      local type="${item%%:*}" name="${item#*:}"
-      
-      case "$type" in
-        alias)
-          if [[ -n "${old_aliases[$name]:-}" ]]; then
-            echo "${old_aliases[$name]}"
-            [[ "${old_aliases[$name]}" != "${new_aliases[$name]}" ]] && preserved_items+=("alias:$name")
-          else
-            echo "${new_aliases[$name]}"
-          fi
-          unset old_aliases["$name"]
-          ;;
-        function)
-          if [[ -n "${old_functions[$name]:-}" ]]; then
-            echo ""
-            echo "${old_functions[$name]}"
-            [[ "${old_functions[$name]}" != "${new_functions[$name]}" ]] && preserved_items+=("function:$name")
-          else
-            echo ""
-            echo "${new_functions[$name]}"
-          fi
-          unset old_functions["$name"]
-          ;;
-      esac
-    done
-    
-    if [[ ${#old_aliases[@]} -gt 0 || ${#old_functions[@]} -gt 0 ]]; then
-      echo ""
-      echo "# Custom aliases/functions preserved from previous version"
-      
-      for name in "${!old_aliases[@]}"; do
-        echo "${old_aliases[$name]}"
-        preserved_items+=("alias:$name")
-      done
-      
-      for name in "${!old_functions[@]}"; do
-        echo ""
-        echo "${old_functions[$name]}"
-        preserved_items+=("function:$name")
-      done
-    fi
-    
-    echo ""
+    log_success "Alias files merged successfully into '$output'."
   } > "$output"
-  
-  if [[ ${#preserved_items[@]} -gt 0 ]]; then
-    log_info "Preserved ${#preserved_items[@]} customizations from installed version:"
-    for item in "${preserved_items[@]}"; do
-      log_info "  - ${item}"
-    done
-  else
-    log_info "No customizations detected - using cleanpack as-is"
-  fi
 }
+
 
 # ============================================================================
 # Disk Space Validation
@@ -820,3 +765,4 @@ main() {
 }
 
 main "$@"
+
